@@ -25,7 +25,8 @@ session_state = {
     'logs_queue': [],
     'is_running': False,
     'is_paused': False,
-    'start_time': None
+    'start_time': None,
+    'completed_summary': {}
 }
 session_lock = threading.Lock()
 
@@ -38,6 +39,24 @@ DEPARTMENTS = [
 # Define Known Bad IPs and URLs for story generation
 KNOWN_BAD_IPS = ["203.0.113.5", "198.51.100.12", "209.165.201.25"]
 KNOWN_BAD_URLS = ["http://malicious-phishing.com/login", "http://exploit-kit.ru/payload", "http://ransomware-c2.net/checkin"]
+
+# Gambit Data Pipeline Demo — noise vs. signal event pools
+GAMBIT_NOISE_EVENTS = [
+    {'name': 'Auth.Success',    'severity': 2, 'event_id': 40001, 'message': 'Routine user authentication successful'},
+    {'name': 'Network.Flow',    'severity': 1, 'event_id': 40002, 'message': 'Internal network flow recorded'},
+    {'name': 'Backup.Complete', 'severity': 1, 'event_id': 40003, 'message': 'Scheduled backup task completed successfully'},
+    {'name': 'Health.Check',    'severity': 1, 'event_id': 40004, 'message': 'System health check passed'},
+    {'name': 'File.Access',     'severity': 2, 'event_id': 40005, 'message': 'User accessed a non-sensitive file'},
+    {'name': 'DNS.Query',       'severity': 1, 'event_id': 40006, 'message': 'Routine DNS query resolved successfully'},
+]
+
+GAMBIT_ALERT_EVENTS = [
+    {'name': 'Malware.Detected',  'severity': 9,  'event_id': 40100, 'message': 'Malware detected and quarantined on endpoint'},
+    {'name': 'Credential.Dump',   'severity': 10, 'event_id': 40101, 'message': 'Suspicious LSASS memory access - possible credential dumping'},
+    {'name': 'C2.Beacon',         'severity': 8,  'event_id': 40102, 'message': 'Outbound connection to known C2 IP detected'},
+    {'name': 'Priv.Escalation',   'severity': 9,  'event_id': 40103, 'message': 'User account elevated to Domain Admin without approval'},
+    {'name': 'Data.Exfil',        'severity': 8,  'event_id': 40104, 'message': 'Anomalous high-volume data transfer to external IP detected'},
+]
 
 # The updated HTML template is embedded here as a string
 HTML = '''
@@ -279,6 +298,9 @@ HTML = '''
                             <option value="exfiltration_story">Exfiltration (TA0010)</option>
                             <option value="impact_story">Impact (TA0040)</option>
                         </optgroup>
+                        <optgroup label="Demo Scenarios">
+                            <option value="data_pipeline_demo_story">Data Pipeline Demo</option>
+                        </optgroup>
                     </select>
                 </div>
                 <div class="form-check mb-3">
@@ -353,7 +375,8 @@ HTML = '''
         "CrowdStrike": ["Falcon"],
         "SentinelOne": ["EDR"],
         "Dropbox": ["Events"],
-        "Windows": ["Event Collector"]
+        "Windows": ["Event Collector"],
+        "Gambit": ["Security Events"]
     };
 
     let eventSource = null;
@@ -572,8 +595,13 @@ HTML = '''
 '''
 
 # --- BACKEND LOGIC ---
+def _cef_escape(value):
+    """Escape backslashes and equals signs in CEF extension field values."""
+    return str(value).replace('\\', '\\\\').replace('=', '\\=')
+
 def format_log_line(vendor, product, severity, event_id, message_dict, fmt='cef'):
-    """Formats a log message into a CEF or LEEF string."""
+    """Formats a log message into a CEF string."""
+    mitre_technique = message_dict.pop('mitre_technique', None)
     now = datetime.now()
     log_data = {
         'timestamp': now.isoformat(), 'vendor': vendor, 'product': product, 'severity': severity,
@@ -582,8 +610,19 @@ def format_log_line(vendor, product, severity, event_id, message_dict, fmt='cef'
         'dst_ip': message_dict.get('dst_ip', 'N/A'), 'message': message_dict.get('message', 'N/A')
     }
     header = f'{now.strftime("%b %d %H:%M:%S")} {HOSTNAME} CEF:0|{vendor}|{product}|1.0|{event_id}|{message_dict.get("name", "N/A")}|{severity}|'
-    fields = [f'suser={message_dict.get("username", "")}', f'src={message_dict.get("src_ip", "")}', f'dst={message_dict.get("dst_ip", "")}', f'msg={message_dict.get("message", "")}']
-    log_data['log_line'] = header + " ".join(filter(None, fields))
+    ext = []
+    if message_dict.get('username'):
+        ext.append(f'suser={_cef_escape(message_dict["username"])}')
+    if message_dict.get('src_ip'):
+        ext.append(f'src={_cef_escape(message_dict["src_ip"])}')
+    if message_dict.get('dst_ip'):
+        ext.append(f'dst={_cef_escape(message_dict["dst_ip"])}')
+    if mitre_technique:
+        ext.append(f'cs1={_cef_escape(mitre_technique)}')
+        ext.append('cs1Label=MITRE_Technique')
+    if message_dict.get('message'):
+        ext.append(f'msg={message_dict["message"]}')
+    log_data['log_line'] = header + ' '.join(ext)
     return log_data
 
 def gen_user_info():
@@ -753,6 +792,32 @@ def gen_windows_event_collector_log(fmt='cef', **kwargs):
     message_dict.update(kwargs)
     return format_log_line("Windows", "Event Collector", 2, 18000, message_dict, fmt)
 
+# --- Gambit Log Generators (Data Pipeline Demo) ---
+def gen_gambit_noise_log(fmt='cef', **kwargs):
+    event = random.choice(GAMBIT_NOISE_EVENTS)
+    message_dict = {
+        'name': event['name'],
+        'username': fake.user_name(),
+        'src_ip': fake.ipv4_private(),
+        'dst_ip': fake.ipv4_private(),
+        'message': event['message']
+    }
+    message_dict.update(kwargs)
+    return format_log_line("Gambit", "Security Events", event['severity'], event['event_id'], message_dict, fmt)
+
+def gen_gambit_alert_log(fmt='cef', **kwargs):
+    event = random.choice(GAMBIT_ALERT_EVENTS)
+    is_external = event['name'] in ('C2.Beacon', 'Data.Exfil')
+    message_dict = {
+        'name': event['name'],
+        'username': fake.user_name(),
+        'src_ip': fake.ipv4_private(),
+        'dst_ip': random.choice(KNOWN_BAD_IPS) if is_external else fake.ipv4_private(),
+        'message': event['message']
+    }
+    message_dict.update(kwargs)
+    return format_log_line("Gambit", "Security Events", event['severity'], event['event_id'], message_dict, fmt)
+
 # --- Story Generators ---
 
 def send_log(log_function, sock, csv_writer, dest_ip, dest_port, fmt='cef', **kwargs):
@@ -760,16 +825,7 @@ def send_log(log_function, sock, csv_writer, dest_ip, dest_port, fmt='cef', **kw
     if session_state['stop_event'].is_set(): return
     log_dict = log_function(fmt=fmt, **kwargs)
     log_line = log_dict['log_line']
-    try:
-        socket.inet_aton(dest_ip)
-        resolved_ip = dest_ip
-    except socket.error:
-        try:
-            resolved_ip = socket.gethostbyname(dest_ip)
-        except socket.gaierror:
-            raise ConnectionError(f"Could not resolve hostname: {dest_ip}")
-
-    sock.sendto(log_line.encode('utf-8'), (resolved_ip, dest_port))
+    sock.sendto(log_line.encode('utf-8'), (dest_ip, dest_port))
     if csv_writer: csv_writer.writerow(log_dict)
     with session_lock:
         session_state['logs_queue'].append(f'data: {json.dumps({"log": log_line})}\n\n')
@@ -783,79 +839,97 @@ def rogue_insider_story(config, sock, csv_writer):
     """Generates logs for a rogue insider scenario."""
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    
+
     insider_username = fake.user_name()
     insider_ip = fake.ipv4_private()
 
     send_log(gen_okta_audit_log, sock, csv_writer, dest_ip, dest_port,
-             username=insider_username, 
+             username=insider_username,
+             mitre_technique='T1078',
              message=f'User {insider_username} added to "Domain Admins" group')
 
     sensitive_files = ["Q4_Financial_Forecast.xlsx", "Project_Phoenix_Roadmap.pdf", "employee_salary_data_2025.csv"]
     for fname in sensitive_files:
         send_log(gen_dropbox_log, sock, csv_writer, dest_ip, dest_port,
-                 username=insider_username, 
+                 username=insider_username,
                  src_ip=insider_ip,
+                 mitre_technique='T1048',
                  message=f'User {insider_username} downloaded file "{fname}"')
 
     send_log(gen_proofpoint_log, sock, csv_writer, dest_ip, dest_port,
              username=insider_username,
              src_ip=insider_ip,
+             mitre_technique='T1567',
              message=f'Outbound email to personal address with large attachment detected from {insider_username}')
-    
+
     send_log(gen_google_workspace_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=insider_username,
              name='drive.delete',
+             mitre_technique='T1485',
              message=f'User {insider_username} deleted an item from Google Drive audit log')
+
+    return {'story': 'rogue_insider', 'insider_username': insider_username, 'insider_ip': insider_ip}
 
 def web_server_breach_story(config, sock, csv_writer):
     """Generates logs for a web server breach scenario."""
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    
+
     attacker_ip = fake.ipv4_public()
     web_server_ip = fake.ipv4_private()
 
     send_log(gen_panos_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=attacker_ip, dst_ip=web_server_ip,
+             mitre_technique='T1190',
              message='SQL Injection attempt detected against web server')
-             
+
     send_log(gen_crowdstrike_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=web_server_ip,
+             mitre_technique='T1059.003',
              message=f'Web server process (w3wp.exe) spawned cmd.exe')
 
     send_log(gen_mde_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=web_server_ip,
+             mitre_technique='T1003.001',
              message='LSASS memory accessed by suspicious process originating from web server')
 
     send_log(gen_zscaler_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=web_server_ip, dst_ip=random.choice(KNOWN_BAD_IPS),
+             mitre_technique='T1071.001',
              message='C2 Beaconing detected from web server')
+
+    return {'story': 'web_server_breach', 'attacker_ip': attacker_ip, 'web_server_ip': web_server_ip}
 
 def brute_force_data_theft_story(config, sock, csv_writer):
     """Generates logs for a brute-force and data theft scenario."""
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    
+
     attacker_ip = fake.ipv4_public()
     target_user = fake.user_name()
 
     for _ in range(10): # Simulate multiple failed logins
         send_log(gen_azure_signin_log, sock, csv_writer, dest_ip, dest_port,
                  username=target_user, src_ip=attacker_ip,
-                 name='UserLoginFailed', message='Failed user sign-in attempt')
+                 name='UserLoginFailed', mitre_technique='T1110.001',
+                 message='Failed user sign-in attempt')
 
     send_log(gen_azure_signin_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user, src_ip=attacker_ip,
+             mitre_technique='T1078',
              message='Successful user sign-in')
 
     send_log(gen_m365_email_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user,
+             mitre_technique='T1114.003',
              message='Email forwarding rule created to external address')
 
     send_log(gen_gcp_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user, src_ip=attacker_ip,
+             mitre_technique='T1098',
              message='storage.buckets.update IAM policy changed to public')
+
+    return {'story': 'brute_force_data_theft', 'attacker_ip': attacker_ip, 'target_user': target_user}
 
 def aws_compromise_story(config, sock, csv_writer):
     """Generates logs for an AWS compromise scenario."""
@@ -866,19 +940,25 @@ def aws_compromise_story(config, sock, csv_writer):
 
     send_log(gen_aws_cloudtrail_log, sock, csv_writer, dest_ip, dest_port,
              username=compromised_user, src_ip=attacker_ip,
+             mitre_technique='T1078.004',
              message=f'Successful AWS Console login for user {compromised_user} from unusual IP')
 
     send_log(gen_aws_cloudtrail_log, sock, csv_writer, dest_ip, dest_port,
              username=compromised_user, src_ip=attacker_ip, name='CreateUser',
+             mitre_technique='T1136.003',
              message='New IAM user "backdoor_user" created')
 
     send_log(gen_aws_cloudtrail_log, sock, csv_writer, dest_ip, dest_port,
              username=compromised_user, src_ip=attacker_ip, name='AttachUserPolicy',
+             mitre_technique='T1098.003',
              message='AdministratorAccess policy attached to user "backdoor_user"')
 
     send_log(gen_aws_vpc_flow_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=fake.ipv4_private(), dst_ip=random.choice(KNOWN_BAD_IPS),
+             mitre_technique='T1041',
              message='Large volume of data egress observed from internal instance to known malicious IP')
+
+    return {'story': 'aws_compromise', 'attacker_ip': attacker_ip, 'compromised_user': compromised_user}
 
 def gcp_compromise_story(config, sock, csv_writer):
     """Generates logs for a GCP compromise scenario."""
@@ -889,15 +969,20 @@ def gcp_compromise_story(config, sock, csv_writer):
 
     send_log(gen_gcp_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=attacker_ip, name='v1.iam.serviceAccounts.keys.create',
+             mitre_technique='T1098.001',
              message=f'New service account key created for {compromised_sa}')
 
     send_log(gen_gcp_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=compromised_sa, src_ip=attacker_ip, name='v1.storage.buckets.update',
+             mitre_technique='T1537',
              message='IAM policy on sensitive-data-bucket changed to public')
 
     send_log(gen_gcp_flow_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=fake.ipv4_private(), dst_ip=attacker_ip,
+             mitre_technique='T1041',
              message='Anomalous data transfer from internal GCS bucket to external IP')
+
+    return {'story': 'gcp_compromise', 'attacker_ip': attacker_ip, 'compromised_sa': compromised_sa}
 
 def azure_compromise_story(config, sock, csv_writer):
     """Generates logs for an Azure compromise scenario."""
@@ -908,90 +993,119 @@ def azure_compromise_story(config, sock, csv_writer):
 
     send_log(gen_azure_signin_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user, src_ip=attacker_ip,
+             mitre_technique='T1078.004',
              message='Successful sign-in from unfamiliar location')
 
     send_log(gen_azure_ad_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user, name='Add owner to application',
+             mitre_technique='T1098.003',
              message='Owner added to a high-privilege enterprise application')
 
     send_log(gen_azure_audit_log, sock, csv_writer, dest_ip, dest_port,
              username=target_user, src_ip=attacker_ip, name='Microsoft.Storage/storageAccounts/listkeys/action',
+             mitre_technique='T1552.005',
              message='Storage account keys listed for production_data_storage')
 
     send_log(gen_azure_flow_log, sock, csv_writer, dest_ip, dest_port,
              src_ip=fake.ipv4_private(), dst_ip=random.choice(KNOWN_BAD_IPS),
+             mitre_technique='T1041',
              message='High-volume data egress from Azure storage to known malicious IP')
+
+    return {'story': 'azure_compromise', 'attacker_ip': attacker_ip, 'target_user': target_user}
 
 # --- MITRE ATT&CK Tactic Stories ---
 def reconnaissance_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_panos_log, sock, csv_writer, dest_ip, dest_port, src_ip=fake.ipv4_public(), dst_ip=fake.ipv4_public(), message='Network port scan detected from external source')
+    send_log(gen_panos_log, sock, csv_writer, dest_ip, dest_port, src_ip=fake.ipv4_public(), dst_ip=fake.ipv4_public(), mitre_technique='T1595', message='Network port scan detected from external source')
 
 def resource_development_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_gcp_audit_log, sock, csv_writer, dest_ip, dest_port, username='suspicious_user', message='New VM instance created with public IP')
+    send_log(gen_gcp_audit_log, sock, csv_writer, dest_ip, dest_port, username='suspicious_user', mitre_technique='T1583', message='New VM instance created with public IP')
 
 def initial_access_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_proofpoint_log, sock, csv_writer, dest_ip, dest_port, message=f'User clicked a malicious link in a phishing email to {random.choice(KNOWN_BAD_URLS)}')
+    send_log(gen_proofpoint_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1566.002', message=f'User clicked a malicious link in a phishing email to {random.choice(KNOWN_BAD_URLS)}')
 
 def execution_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_crowdstrike_log, sock, csv_writer, dest_ip, dest_port, message='powershell.exe executed with encoded command')
+    send_log(gen_crowdstrike_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1059.001', message='powershell.exe executed with encoded command')
 
 def persistence_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_azure_ad_audit_log, sock, csv_writer, dest_ip, dest_port, message='New user account created and added to Global Administrators')
+    send_log(gen_azure_ad_audit_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1136', message='New user account created and added to Global Administrators')
 
 def privilege_escalation_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_okta_audit_log, sock, csv_writer, dest_ip, dest_port, message='User privilege escalated to Super Admin')
+    send_log(gen_okta_audit_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1078', message='User privilege escalated to Super Admin')
 
 def defense_evasion_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_windows_event_collector_log, sock, csv_writer, dest_ip, dest_port, name='System Event Log Cleared', message='The system event log was cleared by an administrator')
+    send_log(gen_windows_event_collector_log, sock, csv_writer, dest_ip, dest_port, name='System Event Log Cleared', mitre_technique='T1070.001', message='The system event log was cleared by an administrator')
 
 def credential_access_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_mde_log, sock, csv_writer, dest_ip, dest_port)
+    send_log(gen_mde_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1003.001')
 
 def discovery_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_windows_event_collector_log, sock, csv_writer, dest_ip, dest_port, name='Network Discovery Command', message='Command executed: netstat -an')
+    send_log(gen_windows_event_collector_log, sock, csv_writer, dest_ip, dest_port, name='Network Discovery Command', mitre_technique='T1049', message='Command executed: netstat -an')
 
 def lateral_movement_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_azure_signin_log, sock, csv_writer, dest_ip, dest_port, src_ip=fake.ipv4_private(), message='Successful remote login to another host on the network')
+    send_log(gen_azure_signin_log, sock, csv_writer, dest_ip, dest_port, src_ip=fake.ipv4_private(), mitre_technique='T1021', message='Successful remote login to another host on the network')
 
 def collection_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_dropbox_log, sock, csv_writer, dest_ip, dest_port, message='Large number of files downloaded from multiple folders')
+    send_log(gen_dropbox_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1039', message='Large number of files downloaded from multiple folders')
 
 def command_and_control_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_zscaler_log, sock, csv_writer, dest_ip, dest_port)
+    send_log(gen_zscaler_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1071.001')
 
 def exfiltration_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_m365_email_log, sock, csv_writer, dest_ip, dest_port, message='Email sent to external domain with large encrypted attachment')
+    send_log(gen_m365_email_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1048.003', message='Email sent to external domain with large encrypted attachment')
 
 def impact_story(config, sock, csv_writer):
     dest_ip = config.get('dest_ip', '127.0.0.1')
     dest_port = int(config.get('dest_port', 514))
-    send_log(gen_sentinelone_log, sock, csv_writer, dest_ip, dest_port)
+    send_log(gen_sentinelone_log, sock, csv_writer, dest_ip, dest_port, mitre_technique='T1486')
+
+def data_pipeline_demo_story(config, sock, csv_writer):
+    """
+    Generates a ~5:1 mix of low-severity noise and high-severity alert events,
+    all from the 'Gambit / Security Events' source. Used to demo Data Pipeline
+    filter rules in XSIAM — write 'filter severity < 4' in the pipeline and run
+    Simulate to show noise dropped, alerts preserved.
+    """
+    dest_ip = config.get('dest_ip', '127.0.0.1')
+    dest_port = int(config.get('dest_port', 514))
+
+    # Build sequence: 5 noise per alert, 5 alert cycles = 30 total events
+    sequence = []
+    for _ in range(5):
+        for _ in range(5):
+            sequence.append(gen_gambit_noise_log)
+        sequence.append(gen_gambit_alert_log)
+    random.shuffle(sequence)
+
+    for log_func in sequence:
+        if session_state['stop_event'].is_set():
+            break
+        send_log(log_func, sock, csv_writer, dest_ip, dest_port)
 
 # --- NOISE GENERATION ---
 def add_story_noise(config, sock, csv_writer):
@@ -1019,6 +1133,11 @@ def generate_logs_session(config):
     if send_mode == 'story': fmt = 'cef'
     save_file = config.get('save_file', False)
     
+    try:
+        resolved_ip = socket.gethostbyname(dest_ip)
+    except socket.gaierror as e:
+        raise ConnectionError(f"Could not resolve {dest_ip}: {e}")
+    config['dest_ip'] = resolved_ip
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     fhandle, csv_writer = None, None
     if save_file:
@@ -1125,6 +1244,7 @@ def run_story_session(config, sock, csv_writer):
         'command_and_control_story': command_and_control_story,
         'exfiltration_story': exfiltration_story,
         'impact_story': impact_story,
+        'data_pipeline_demo_story': data_pipeline_demo_story,
     }
 
     story_func = story_functions.get(story_type)
@@ -1134,7 +1254,10 @@ def run_story_session(config, sock, csv_writer):
             noise_thread.daemon = True
             noise_thread.start()
         
-        story_func(config, sock, csv_writer)
+        result = story_func(config, sock, csv_writer)
+        if result:
+            with session_lock:
+                session_state['completed_summary'] = result
 
         if add_noise:
             noise_thread.join()
@@ -1162,6 +1285,7 @@ def start_generation():
         session_state['stop_event'].clear()
         session_state['pause_event'].clear()
         session_state['logs_queue'].clear()
+        session_state['completed_summary'] = {}
         session_state['is_running'] = True
         session_state['is_paused'] = False
         
@@ -1220,7 +1344,8 @@ def status():
         return jsonify({
             'is_running': session_state['is_running'],
             'is_paused': session_state['is_paused'],
-            'message': message
+            'message': message,
+            'completed_summary': session_state.get('completed_summary', {})
         })
 
 @app.route('/stream')
@@ -1239,6 +1364,22 @@ def stream():
                     last_sent_index = queue_len
             time.sleep(0.1)
     return Response(event_stream(), mimetype='text/event-stream')
+
+@app.route('/stories', methods=['GET'])
+def list_stories():
+    return jsonify({
+        'attack_scenarios': [
+            'rogue_insider_story', 'web_server_breach_story', 'brute_force_data_theft_story',
+            'aws_compromise_story', 'gcp_compromise_story', 'azure_compromise_story'
+        ],
+        'mitre_tactics': [
+            'reconnaissance_story', 'resource_development_story', 'initial_access_story',
+            'execution_story', 'persistence_story', 'privilege_escalation_story',
+            'defense_evasion_story', 'credential_access_story', 'discovery_story',
+            'lateral_movement_story', 'collection_story', 'command_and_control_story',
+            'exfiltration_story', 'impact_story'
+        ]
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, threaded=True, host='0.0.0.0', port=5001)
